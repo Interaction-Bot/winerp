@@ -20,6 +20,16 @@ from typing import (
 import orjson
 import websockets
 
+
+def _ws_is_open(ws) -> bool:
+    """True if the websocket is open, whatever the websockets version (<=12 legacy API, >=14 asyncio API)."""
+    state = getattr(ws, 'state', None)
+    if state is not None:
+        return getattr(state, 'name', None) == 'OPEN'
+
+    return bool(ws.open)
+
+
 from .lib.errors import (
     ClientNotReadyError,
     ClientRuntimeError,
@@ -111,7 +121,7 @@ class Client:
         logger.info("Verification request sent")
 
     async def __connect(self) -> None:
-        if self.websocket is None or self.websocket.closed:
+        if self.websocket is None or (not _ws_is_open(self.websocket)):
             logger.info("Connecting to Websocket")
             self.websocket = await websockets.connect(
                 self.uri,
@@ -148,7 +158,7 @@ class Client:
         -------
             :class:`None`
         """
-        if self.websocket is None or self.websocket.closed:
+        if self.websocket is None or (not _ws_is_open(self.websocket)):
             await self.__connect()
             await self.__verify_client()
             asyncio.create_task(self.__on_message())
@@ -266,7 +276,7 @@ class Client:
             :class:`bool`
                 If the ping is successful, it returns True.
         """
-        if self._on_hold or self.websocket is None or not self.websocket.open:
+        if self._on_hold or self.websocket is None or not _ws_is_open(self.websocket):
             raise ClientNotReadyError("The client is currently not ready to send or accept requests.")
         if not self._authorized:
             raise UnauthorizedError("Client is not authorized!")
@@ -284,7 +294,7 @@ class Client:
         return resp.get("success", False)
 
     async def _call_function(self, destination, object_identifier, func_name, *args, **kwargs) -> bool:
-        if self._on_hold or self.websocket is None or not self.websocket.open:
+        if self._on_hold or self.websocket is None or not _ws_is_open(self.websocket):
             raise ClientNotReadyError("The client is currently not ready to send or accept requests.")
         if not self._authorized:
             raise UnauthorizedError("Client is not authorized!")
@@ -356,7 +366,7 @@ class Client:
             :class:`Any`
                 The data associated with the message.
         """
-        if self.websocket is not None and self.websocket.open:
+        if self.websocket is not None and _ws_is_open(self.websocket):
             if self._on_hold:
                 raise ClientNotReadyError("The client is currently not ready to send or accept requests.")
             if not self._authorized:
@@ -401,7 +411,7 @@ class Client:
             :class:`list`
                 A list of connected clients.
         """
-        if self._on_hold or self.websocket is None or not self.websocket.open:
+        if self._on_hold or self.websocket is None or not _ws_is_open(self.websocket):
             raise ClientNotReadyError("The client is currently not ready to send or accept requests.")
         if not self._authorized:
             raise UnauthorizedError("Client is not authorized!")
@@ -448,7 +458,7 @@ class Client:
         --------
             :class:`None`
         """
-        if self.websocket is not None and self.websocket.open:
+        if self.websocket is not None and _ws_is_open(self.websocket):
             if self._on_hold:
                 raise ClientNotReadyError("The client is currently not ready to send or accept requests.")
             if not self._authorized:
