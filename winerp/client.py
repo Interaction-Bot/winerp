@@ -159,9 +159,16 @@ class Client:
             :class:`None`
         """
         if self.websocket is None or (not _ws_is_open(self.websocket)):
-            await self.__connect()
-            await self.__verify_client()
-            asyncio.create_task(self.__on_message())
+            try:
+                await self.__connect()
+                await self.__verify_client()
+            except Exception as error:  # pylint: disable=W0718
+                # server not listening yet (the clients of a bot can start before it): retry instead of staying disconnected forever
+                if not self.reconnect:
+                    raise
+                logger.error("Could not connect to the winerp server (%s), retrying", error)
+                await self.__reconnect_client()
+            self._reader = asyncio.create_task(self.__on_message())  # strong reference: a task nobody holds can be garbage collected
         else:
             raise ConnectionError("Websocket is already connected!")
 
@@ -540,101 +547,120 @@ class Client:
         return asyncio.wait_for(future, timeout)
 
     async def __on_message(self):
+        """Reads the messages of the server forever.
+
+        This loop must never die: a request for an unknown route, an unreadable message or any exception of a handler
+        used to end it silently (the client then stopped reading and every request sent to it timed out, while the
+        server still saw it connected). Each message is now handled on its own, and an exception is logged and skipped.
+        """
         logger.info("Listening to messages")
-        message = None
         while True:
             try:
                 message = WsMessage(orjson.loads(await self.websocket.recv()))
-            except websockets.exceptions.ConnectionClosedError:
+            except asyncio.CancelledError:
+                raise
+            except websockets.exceptions.ConnectionClosed:
+                # ConnectionClosedError (abnormal) and ConnectionClosedOK (clean close by the server)
                 self.__events.dispatch_event('winerp_disconnect')
                 if self.reconnect:
                     if not await self.__reconnect_client():
                         break
-                else:
-                    break
+                    continue
+                break
+            except Exception:  # pylint: disable=W0718
+                logger.exception("Unreadable message from the server, skipped")
+                continue
 
-            if message.type.success and not self._authorized:
-                logger.info("Authorized Successfully")
-                self.__events.dispatch_event('winerp_ready')
-                self._authorized = True
-                self._on_hold = False
+            try:
+                await self.__handle_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pylint: disable=W0718
+                logger.exception("Failed to handle a message of the server, skipped")
 
-            elif message.type.ping:
-                logger.debug("Received a ping from server")
-                asyncio.create_task(self._dispatch(message))
+    async def __handle_message(self, message: WsMessage):
+        if message.type.success and not self._authorized:
+            logger.info("Authorized Successfully")
+            self.__events.dispatch_event('winerp_ready')
+            self._authorized = True
+            self._on_hold = False
 
-            elif message.type.request:
-                if message.route not in self.__routes:
-                    logger.info("Failed to fulfill request, route not found")
-                    payload = MessagePayload(
-                        type=Payloads.error,
-                        id=self.local_name,
-                        data="Route not found",
-                        traceback="Route not found",
-                        destination=message.id,
-                        uuid=message.uuid
-                    )
-                    self.__send_message(payload)
-                    return
-                logger.info("Fulfilling request @ route: %s", message.route)
-                asyncio.create_task(self._fulfill_request(message))
-                self.__events.dispatch_event('winerp_request')
+        elif message.type.ping:
+            logger.debug("Received a ping from server")
+            asyncio.create_task(self._dispatch(message))
 
-            elif message.type.response:
-                logger.info("Received a response from server @ uuid: %s", message.uuid)
-                asyncio.create_task(self._dispatch(message))
-                self.__events.dispatch_event('winerp_response')
-
-            elif message.type.error:
-                if message.data == "Already authorized.":
-                    self._on_hold = True
-                    logger.warning(
-                        "Another client is already connected. Requests will be enabled when the other is disconnected.")
-                else:
-                    logger.debug("Failed to fulfill request: %s", message.data)
-                    self.__events.dispatch_event('winerp_error', message.data)
-
-                if message.uuid is not None:
-                    asyncio.create_task(self._dispatch(message))
-
-            elif message.type.information:
-                if message.data:
-                    logger.debug("Received an information bit from client: %s", message.id)
-                    self.__events.dispatch_event('winerp_information', message.data, message.id)
-
-            elif message.type.client_count:
-                logger.debug("Received the response of the client_count from server")
-                asyncio.create_task(self._dispatch(message))
-
-            elif message.type.function_call:
-                logger.debug("Received an object function call.")
-                logger.debug(message.data)
+        elif message.type.request:
+            if message.route not in self.__routes:
+                logger.info("Failed to fulfill request, route not found")
                 payload = MessagePayload(
-                    type=Payloads.response,
+                    type=Payloads.error,
                     id=self.local_name,
+                    data="Route not found",
+                    traceback="Route not found",
                     destination=message.id,
                     uuid=message.uuid
                 )
-                try:
-                    called_function = self.__sub_routes[message.data["__uuid__"]][message.data["__func__"]]
-                    asyncio.create_task(
-                        self._fulfil_callback(
-                            payload,
-                            called_function,
-                            *message.data["__args__"],
-                            **message.data["__kwargs__"]
-                        )
+                self.__send_message(payload)
+                return
+            logger.info("Fulfilling request @ route: %s", message.route)
+            asyncio.create_task(self._fulfill_request(message))
+            self.__events.dispatch_event('winerp_request')
+
+        elif message.type.response:
+            logger.info("Received a response from server @ uuid: %s", message.uuid)
+            asyncio.create_task(self._dispatch(message))
+            self.__events.dispatch_event('winerp_response')
+
+        elif message.type.error:
+            if message.data == "Already authorized.":
+                self._on_hold = True
+                logger.warning(
+                    "Another client is already connected. Requests will be enabled when the other is disconnected.")
+            else:
+                logger.debug("Failed to fulfill request: %s", message.data)
+                self.__events.dispatch_event('winerp_error', message.data)
+
+            if message.uuid is not None:
+                asyncio.create_task(self._dispatch(message))
+
+        elif message.type.information:
+            if message.data:
+                logger.debug("Received an information bit from client: %s", message.id)
+                self.__events.dispatch_event('winerp_information', message.data, message.id)
+
+        elif message.type.client_count:
+            logger.debug("Received the response of the client_count from server")
+            asyncio.create_task(self._dispatch(message))
+
+        elif message.type.function_call:
+            logger.debug("Received an object function call.")
+            logger.debug(message.data)
+            payload = MessagePayload(
+                type=Payloads.response,
+                id=self.local_name,
+                destination=message.id,
+                uuid=message.uuid
+            )
+            try:
+                called_function = self.__sub_routes[message.data["__uuid__"]][message.data["__func__"]]
+                asyncio.create_task(
+                    self._fulfil_callback(
+                        payload,
+                        called_function,
+                        *message.data["__args__"],
+                        **message.data["__kwargs__"]
                     )
-                except KeyError:
-                    payload = MessagePayload(
-                        type=Payloads.error,
-                        id=self.local_name,
-                        data="The called function has either expired or has never been registered",
-                        traceback="The called function has either expired or has never been registered",
-                        destination=message.id,
-                        uuid=message.uuid
-                    )
-                    self.__send_message(payload)
+                )
+            except KeyError:
+                payload = MessagePayload(
+                    type=Payloads.error,
+                    id=self.local_name,
+                    data="The called function has either expired or has never been registered",
+                    traceback="The called function has either expired or has never been registered",
+                    destination=message.id,
+                    uuid=message.uuid
+                )
+                self.__send_message(payload)
 
     def __parse_object(self, payload):
         payload.pseudo_object = True
