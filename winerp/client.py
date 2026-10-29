@@ -324,7 +324,7 @@ class Client:
         recv = await self.__get_response(_uuid, asyncio.get_event_loop(), timeout=30)
         return recv
 
-    def __get_response(
+    async def __get_response(
             self,
             _uuid: str,
             loop: asyncio.AbstractEventLoop,
@@ -332,7 +332,12 @@ class Client:
     ):
         future = loop.create_future()
         self.listeners[_uuid] = future
-        return asyncio.wait_for(future, timeout)
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            # the listener of a request lives as long as its request: it used to stay for ever (a Future holding the whole answer per request,
+            # ~7 KB each for the dashboard: +90 MB a day on the backend of the site)
+            self.listeners.pop(_uuid, None)
 
     async def request(
             self,
@@ -544,6 +549,7 @@ class Client:
             self.__events.listeners[_event] = listeners
 
         listeners.append(future)
+        future.add_done_callback(lambda done: listeners.remove(done) if done in listeners else None)      # the waiters of an event are not kept once it came or timed out
         return asyncio.wait_for(future, timeout)
 
     async def __on_message(self):
@@ -734,10 +740,12 @@ class Client:
         _uuid = msg.uuid
         if _uuid is None:
             raise MissingUUIDError('UUID is missing.')
-        if _uuid not in self.listeners:
-            raise UUIDNotFoundError(f"UUID {_uuid} not found in listeners.")
+        future: asyncio.Future | None = self.listeners.get(_uuid)
+        if future is None or future.done():
+            # the answer of a request that timed out or was cancelled (its listener is gone): nothing waits for it any more
+            logger.debug("Ignoring the answer %s: no request is waiting for it.", _uuid)
+            return
 
-        future: asyncio.Future = self.listeners[_uuid]
         if not msg.type.error:
             if msg.pseudo_object:
                 future.set_result(responseObject(self, msg.id, data))
