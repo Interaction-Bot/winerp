@@ -43,7 +43,7 @@ class Server:
     # A client that verifies under a name already active waits on hold while the server checks the old connection:
     # a websocket ping, and the old one is closed if no pong comes back within `liveness_timeout` seconds. The check is
     # repeated every `liveness_interval` seconds while someone waits. A live client is never ejected.
-    liveness_timeout = 3.0
+    liveness_timeout = 10.0
     liveness_interval = 30.0
 
     def __init__(
@@ -59,7 +59,8 @@ class Server:
         self.websocket._pong_received_ = self._pong_received
         self.active_clients = {}
         self.pending_verification = {}
-        self.on_hold_connections = {}
+        self.on_hold_connections = {}                                   # name -> connections waiting, oldest first
+        self._checking = set()                                          # names whose old connection is being checked
         # Each connection runs in its own thread (websocket_server): the dicts above are only touched under this lock,
         # and nothing is sent while holding it (a send to a dead peer can block).
         self._lock = threading.RLock()
@@ -77,7 +78,7 @@ class Server:
         # AssertionError: one debug line instead of a full traceback every few seconds, which flushed the useful
         # lines out of the container log.
         error = sys.exc_info()[1]
-        if isinstance(error, (AssertionError, ConnectionError)):
+        if isinstance(error, (AssertionError, ConnectionError, KeyError, ValueError)):
             logger.debug("Not a websocket connection from %s: %r" % (client_address, error))
             return
         logger.exception("Error on the connection from %s" % (client_address,))
@@ -110,14 +111,15 @@ class Server:
         promoted = None
         with self._lock:
             self.pending_verification.pop(cid, None)
-            for name, each_client in list(self.on_hold_connections.items()):
-                if each_client["id"] == cid:
+            for name, waiting in list(self.on_hold_connections.items()):
+                waiting[:] = [each for each in waiting if each["id"] != cid]
+                if not waiting:
                     del self.on_hold_connections[name]
             for name, each_client in list(self.active_clients.items()):
                 if each_client["id"] == cid:
                     del self.active_clients[name]
                     logger.info("Client %s disconnected (connection %s)" % (name, cid))
-                    promoted = self.on_hold_connections.pop(name, None)
+                    promoted = self._pop_held(name)
                     if promoted is not None:
                         self.active_clients[name] = promoted
                     break
@@ -126,6 +128,16 @@ class Server:
         if promoted is not None:
             logger.info("Client %s on hold moved to active (connection %s)" % (name, promoted["id"]))
             self.__send_message(promoted["client"], MessagePayload(type=Payloads.success, data="Authorized."))
+
+    def _pop_held(self, name):
+        # the newest connection on hold: the most likely to be alive. Called under the lock.
+        waiting = self.on_hold_connections.get(name)
+        if not waiting:
+            return None
+        held = waiting.pop()
+        if not waiting:
+            del self.on_hold_connections[name]
+        return held
 
     def _check_liveness(self, name, delay):
         """Pings the active connection of `name` (a client waits on hold for this name), then decides.
@@ -136,7 +148,8 @@ class Server:
         """
         with self._lock:
             active = self.active_clients.get(name)
-            if active is None or name not in self.on_hold_connections:
+            if active is None or not self.on_hold_connections.get(name):
+                self._checking.discard(name)                            # nobody waits any more: the check ends
                 return
         handler = active["client"]["handler"]
         sent = time.monotonic()
@@ -157,16 +170,28 @@ class Server:
         promoted = None
         with self._lock:
             active = self.active_clients.get(name)
-            held = self.on_hold_connections.get(name)
-            if active is None or active["id"] != old_id or held is None:
-                return                                                  # already settled
-            alive = getattr(handler, "winerp_pong", 0) >= sent
-            if not alive:
-                promoted = self.on_hold_connections.pop(name)
+            if active is None or not self.on_hold_connections.get(name):
+                self._checking.discard(name)                            # nobody waits any more
+                return
+            restart = active["id"] != old_id                            # another one became active meanwhile
+            if restart:
+                alive = None
+            else:
+                alive = getattr(handler, "winerp_pong", 0) >= sent
+            if alive is False:
+                promoted = self._pop_held(name)
                 self.active_clients[name] = promoted
                 self.pending_verification.pop(promoted["id"], None)
+                restart = bool(self.on_hold_connections.get(name))     # others still wait: check the new one
+                if not restart:
+                    self._checking.discard(name)
+            elif alive:
+                waiting = [each["id"] for each in self.on_hold_connections[name]]
+        if alive is None:
+            self._check_liveness(name, self.liveness_timeout)
+            return
         if alive:
-            logger.info("Client %s: connection %s is alive, connection %s stays on hold" % (name, old_id, held["id"]))
+            logger.info("Client %s: connection %s is alive, connections %s stay on hold" % (name, old_id, waiting))
             timer = threading.Timer(self.liveness_interval, self._check_liveness, args=(name, self.liveness_timeout))
             timer.daemon = True
             timer.start()
@@ -174,6 +199,8 @@ class Server:
         logger.info("Client %s: connection %s does not answer, replaced by connection %s" % (name, old_id, promoted["id"]))
         self.__send_message(promoted["client"], MessagePayload(type=Payloads.success, data="Authorized."))
         self._close(handler)
+        if restart:
+            self._check_liveness(name, self.liveness_timeout)
 
     @staticmethod
     def _close(handler):
@@ -219,8 +246,9 @@ class Server:
                 if old is not None and old["id"] == cid:
                     old = None                                          # same connection verifying twice
                 if old is not None:
-                    previous = self.on_hold_connections.get(msg.id)
-                    self.on_hold_connections[msg.id] = {"client": client, "id": cid}
+                    self.on_hold_connections.setdefault(msg.id, []).append({"client": client, "id": cid})
+                    check = msg.id not in self._checking                # one check at a time per name
+                    self._checking.add(msg.id)
                 else:
                     self.active_clients[msg.id] = {"client": client, "id": cid}
                     self.pending_verification.pop(cid, None)
@@ -231,7 +259,7 @@ class Server:
                 payload.data = "Already authorized."
                 payload.traceback = "Already authorized."
                 self.__send_error(client, payload)
-                if previous is None:                                    # else a check is already running
+                if check:
                     self._check_liveness(msg.id, self.liveness_timeout)
                 return
             logger.info("Client %s verified (connection %s from %s)" % (msg.id, cid, self._peer(client)))

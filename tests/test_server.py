@@ -190,3 +190,37 @@ async def test_unreadable_message_does_not_close_the_connection(server):
     await asyncio.sleep(0.3)
     assert 'Cluster 5' in server.active_clients
     sock.close()
+
+
+async def test_several_clients_on_hold_are_all_served_in_turn(server):
+    first = await make_client(server, 'Dashboard', who='first')
+    asker = await make_client(server, 'Cluster 0')
+    second = await make_client_on_hold(server, 'Dashboard', who='second')
+    third = await make_client_on_hold(server, 'Dashboard', who='third')
+    assert [each['id'] for each in server.on_hold_connections['Dashboard']] == sorted(
+        each['id'] for each in server.on_hold_connections['Dashboard'])
+    for client, next_one, name in ((first, third, 'third'), (third, second, 'second')):
+        client.reconnect = False
+        await client.websocket.close()
+        await until(lambda: next_one.authorized and not next_one.on_hold)   # the newest waiting one first
+        assert await asker.request('who', 'Dashboard', timeout=5) == name
+    assert not server.on_hold_connections
+
+
+async def test_one_liveness_check_at_a_time(server):
+    server.liveness_interval = 0.3
+    pings = []
+    real_ping = server._ping
+    server._ping = lambda handler: (pings.append(handler), real_ping(handler))
+    first = await make_client(server, 'Dashboard', who='first')
+    for _ in range(5):                                          # clients on hold that come and go
+        held = await make_client_on_hold(server, 'Dashboard')
+        held.reconnect = False
+        await held.websocket.close()
+        await asyncio.sleep(0.05)
+    await make_client_on_hold(server, 'Dashboard')
+    pings.clear()
+    await asyncio.sleep(2)
+    # one chain: a ping every liveness_timeout + liveness_interval (0.8 s), so at most 3 in 2 s
+    assert 1 <= len(pings) <= 3
+    assert first.authorized
