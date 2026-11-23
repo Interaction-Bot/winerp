@@ -9,7 +9,8 @@ import time
 original_basicConfig = logging.basicConfig
 logging.basicConfig = noop
 
-from websocket_server import WebsocketServer, CLOSE_STATUS_NORMAL
+from websocket_server import WebsocketServer
+from websocket_server.websocket_server import OPCODE_PING
 logging.basicConfig = original_basicConfig
 
 import orjson
@@ -39,10 +40,11 @@ class Server:
         The port on which the server is running. Defaults to 13254.
     """
 
-    # A connection verified less than this many seconds ago is not replaced by a new one of the same name: the new
-    # one waits on hold instead (and takes over when the other leaves). Without it, two live processes with the same
-    # name would replace each other in a tight loop (a client reconnects at once when it is closed).
-    replace_grace = 10.0
+    # A client that verifies under a name already active waits on hold while the server checks the old connection:
+    # a websocket ping, and the old one is closed if no pong comes back within `liveness_timeout` seconds. The check is
+    # repeated every `liveness_interval` seconds while someone waits. A live client is never ejected.
+    liveness_timeout = 3.0
+    liveness_interval = 30.0
 
     def __init__(
             self,
@@ -54,10 +56,12 @@ class Server:
         self.websocket.set_fn_message_received(self.__on_message)
         self.websocket.set_fn_client_left(self.__on_client_disconnect)
         self.websocket.handle_error = self._handle_error
+        self.websocket._pong_received_ = self._pong_received
         self.active_clients = {}
         self.pending_verification = {}
         self.on_hold_connections = {}
-        # Each connection runs in its own thread (websocket_server): the dicts above are only touched under this lock.
+        # Each connection runs in its own thread (websocket_server): the dicts above are only touched under this lock,
+        # and nothing is sent while holding it (a send to a dead peer can block).
         self._lock = threading.RLock()
 
     @property
@@ -73,7 +77,7 @@ class Server:
         # AssertionError: one debug line instead of a full traceback every few seconds, which flushed the useful
         # lines out of the container log.
         error = sys.exc_info()[1]
-        if isinstance(error, (AssertionError, ConnectionError, ValueError)):
+        if isinstance(error, (AssertionError, ConnectionError)):
             logger.debug("Not a websocket connection from %s: %r" % (client_address, error))
             return
         logger.exception("Error on the connection from %s" % (client_address,))
@@ -87,6 +91,10 @@ class Server:
     def _peer(client):
         address = client.get("address") or ("?", "?")
         return "%s:%s" % (address[0], address[1])
+
+    @staticmethod
+    def _pong_received(handler, _msg):
+        handler.winerp_pong = time.monotonic()
 
     def __on_client_connect(self, client, _):
         logger.info("Client connected from %s (connection %s)" % (self._peer(client), self._cid(client)))
@@ -111,7 +119,7 @@ class Server:
                     logger.info("Client %s disconnected (connection %s)" % (name, cid))
                     promoted = self.on_hold_connections.pop(name, None)
                     if promoted is not None:
-                        self.active_clients[name] = dict(promoted, since=time.monotonic())
+                        self.active_clients[name] = promoted
                     break
             else:
                 logger.info("Client disconnected (connection %s)" % cid)
@@ -119,24 +127,58 @@ class Server:
             logger.info("Client %s on hold moved to active (connection %s)" % (name, promoted["id"]))
             self.__send_message(promoted["client"], MessagePayload(type=Payloads.success, data="Authorized."))
 
-    def _replace(self, name, old):
-        """Closes the previous connection of a client that has just verified again under the same name.
+    def _check_liveness(self, name, delay):
+        """Pings the active connection of `name` (a client waits on hold for this name), then decides.
 
-        Before, the new connection was put on hold until the old one left. When the old one never left (half-open TCP
-        connection of a container that is gone, lost disconnection), the new one stayed on hold forever: on 2026-11-23
-        the dashboard could not reach the bot for 21 minutes after a deploy of the website backend. The newest
-        connection is the live one (unless the old one is very recent, see `replace_grace`): the old socket is shut
-        down, its thread then ends on its own.
+        Before, the client on hold waited until the old connection left. When the old one never left (half-open TCP
+        connection of a container that is gone, frozen process), it waited forever: on 2026-11-23 the dashboard could
+        not reach the bot for 21 minutes after a deploy of the website backend.
         """
-        logger.info("Client %s connected again: connection %s replaced" % (name, old["id"]))
-        handler = old["client"].get("handler")
-        if handler is None:
-            return
-        handler.keep_alive = False
+        with self._lock:
+            active = self.active_clients.get(name)
+            if active is None or name not in self.on_hold_connections:
+                return
+        handler = active["client"]["handler"]
+        sent = time.monotonic()
+        # in its own thread: the send blocks if the old peer is gone with a full buffer
+        threading.Thread(target=self._ping, args=(handler,), daemon=True).start()
+        timer = threading.Timer(delay, self._decide, args=(name, active["id"], handler, sent))
+        timer.daemon = True
+        timer.start()
+
+    @staticmethod
+    def _ping(handler):
         try:
-            handler.send_close(CLOSE_STATUS_NORMAL, b"Replaced by a new connection")
+            handler.send_text("", OPCODE_PING)
         except Exception:  # pylint: disable=W0718
             pass
+
+    def _decide(self, name, old_id, handler, sent):
+        promoted = None
+        with self._lock:
+            active = self.active_clients.get(name)
+            held = self.on_hold_connections.get(name)
+            if active is None or active["id"] != old_id or held is None:
+                return                                                  # already settled
+            alive = getattr(handler, "winerp_pong", 0) >= sent
+            if not alive:
+                promoted = self.on_hold_connections.pop(name)
+                self.active_clients[name] = promoted
+                self.pending_verification.pop(promoted["id"], None)
+        if alive:
+            logger.info("Client %s: connection %s is alive, connection %s stays on hold" % (name, old_id, held["id"]))
+            timer = threading.Timer(self.liveness_interval, self._check_liveness, args=(name, self.liveness_timeout))
+            timer.daemon = True
+            timer.start()
+            return
+        logger.info("Client %s: connection %s does not answer, replaced by connection %s" % (name, old_id, promoted["id"]))
+        self.__send_message(promoted["client"], MessagePayload(type=Payloads.success, data="Authorized."))
+        self._close(handler)
+
+    @staticmethod
+    def _close(handler):
+        # shutdown first: it also unblocks a thread stuck sending to this peer; its thread then ends on its own
+        handler.keep_alive = False
         try:
             handler.request.shutdown(socket.SHUT_RDWR)
         except Exception:  # pylint: disable=W0718
@@ -163,32 +205,35 @@ class Server:
         self.__send_message(client, payload)
 
     def __on_message(self, client, _, msg):
-        msg = WsMessage(orjson.loads(msg))
+        try:
+            msg = WsMessage(orjson.loads(msg))
+        except Exception:  # pylint: disable=W0718
+            logger.exception("Unreadable message from connection %s, skipped" % self._cid(client))
+            return
         payload = MessagePayload().from_message(msg)
         cid = self._cid(client)
 
         if msg.type.verification:
-            hold = False
             with self._lock:
                 old = self.active_clients.get(msg.id)
                 if old is not None and old["id"] == cid:
                     old = None                                          # same connection verifying twice
-                if old is not None and time.monotonic() - old["since"] < self.replace_grace:
-                    hold = True
+                if old is not None:
+                    previous = self.on_hold_connections.get(msg.id)
                     self.on_hold_connections[msg.id] = {"client": client, "id": cid}
                 else:
-                    self.active_clients[msg.id] = {"client": client, "id": cid, "since": time.monotonic()}
+                    self.active_clients[msg.id] = {"client": client, "id": cid}
                     self.pending_verification.pop(cid, None)
-            if hold:
-                logger.info("Client %s connected twice within %ss: connection %s put on hold" % (msg.id, self.replace_grace, cid))
+            if old is not None:
+                logger.info("Client %s connected again (connection %s): on hold while connection %s is checked" % (msg.id, cid, old["id"]))
                 payload.uuid = None
                 payload.type = Payloads.error
                 payload.data = "Already authorized."
                 payload.traceback = "Already authorized."
                 self.__send_error(client, payload)
+                if previous is None:                                    # else a check is already running
+                    self._check_liveness(msg.id, self.liveness_timeout)
                 return
-            if old is not None:
-                self._replace(msg.id, old)
             logger.info("Client %s verified (connection %s from %s)" % (msg.id, cid, self._peer(client)))
             payload.type = Payloads.success
             payload.data = "Authorized."

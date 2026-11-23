@@ -29,6 +29,7 @@ def server():
 
     srv.websocket.handle_error = record
     srv.errors = errors
+    srv.liveness_timeout = 0.5
     srv.websocket.run_forever(threaded=True)
     yield srv
     srv.websocket.shutdown_abruptly()
@@ -46,8 +47,13 @@ async def make_client(server, name, **routes):
     return client
 
 
-async def make_client_on_hold(server, name):
+async def make_client_on_hold(server, name, **routes):
     client = winerp.Client(local_name=name, host='127.0.0.1', port=server.websocket.port)
+    client.reconnect_threshold = 0.2
+    for route_name, value in routes.items():
+        async def handler(source, value=value):
+            return value
+        await client.add_route(handler, route_name)
     await client.start()
     await until(lambda: client.on_hold)
     return client
@@ -69,69 +75,87 @@ def raw_verified_connection(server, name):
         'Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n' % key
     ).encode())
     assert b'101' in sock.recv(1024)
-    data = json.dumps({'type': 1, 'id': name, 'uuid': 'v'}).encode()
-    mask = os.urandom(4)
-    sock.sendall(bytes([0x81, 0x80 | len(data)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+    send_frame(sock, json.dumps({'type': 1, 'id': name, 'uuid': 'v'}).encode())
     return sock
 
 
-async def test_same_name_replaces_the_old_connection(server):
-    old = await make_client(server, 'Dashboard')
-    old.reconnect = False                                       # the old process is going away
-    server.active_clients['Dashboard']['since'] -= 60                  # connected for a while
-    asker = await make_client(server, 'Cluster 0')
-    new = await make_client(server, 'Dashboard', who='new')     # before: put on hold, "Already authorized."
-    assert new.authorized and not new.on_hold
-    assert await asker.request('who', 'Dashboard', timeout=5) == 'new'
-    await until(lambda: len(server.active_clients) == 2)
-    # the disconnection of the replaced connection does not remove the new one
-    await asyncio.sleep(0.3)
-    assert server.active_clients['Dashboard']['client'] is not None
-    assert await asker.request('who', 'Dashboard', timeout=5) == 'new'
-    assert sorted(server.active_clients) == ['Cluster 0', 'Dashboard']
-    assert not server.errors
+def send_frame(sock, data):
+    mask = os.urandom(4)
+    sock.sendall(bytes([0x81, 0x80 | len(data)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
 
 
-async def test_half_open_old_connection_does_not_block_the_new_one(server):
+async def test_new_connection_replaces_a_dead_one(server):
     """The incident of 2026-11-23: the old "Dashboard" connection never left, the new backend stayed on hold."""
-    ghost = raw_verified_connection(server, 'Dashboard')
+    ghost = raw_verified_connection(server, 'Dashboard')       # verified, then never answers (gone, frozen)
     await until(lambda: 'Dashboard' in server.active_clients)
-    server.active_clients['Dashboard']['since'] -= 60                  # connected for a while
     asker = await make_client(server, 'Cluster 0')
-    new = await make_client(server, 'Dashboard', who='new')
-    assert new.authorized and not new.on_hold
+    new = await make_client_on_hold(server, 'Dashboard', who='new')
+    await until(lambda: new.authorized and not new.on_hold)     # no pong from the ghost: replaced
     assert await asker.request('who', 'Dashboard', timeout=5) == 'new'
     ghost.settimeout(2)
-    received = b''
-    while chunk := ghost.recv(4096):                           # the server closed the ghost
-        received += chunk
-    assert received.endswith(b'Replaced by a new connection')
+    while ghost.recv(4096):                                    # the server closed the ghost
+        pass
+    ghost.close()
+    await asyncio.sleep(0.3)                                   # its disconnection does not remove the new one
+    assert await asker.request('who', 'Dashboard', timeout=5) == 'new'
+    assert sorted(server.active_clients) == ['Cluster 0', 'Dashboard']
+    assert not server.on_hold_connections and not server.errors
+
+
+async def test_live_connection_is_never_ejected(server):
+    """Two live processes with the same name (should not happen): the first keeps the name, no reconnection loop."""
+    first = await make_client(server, 'Dashboard', who='first')
+    asker = await make_client(server, 'Cluster 0')
+    second = await make_client_on_hold(server, 'Dashboard', who='second')
+    connections = server.websocket.id_counter
+    await asyncio.sleep(server.liveness_timeout * 3)
+    assert second.on_hold and first.authorized
+    assert server.websocket.id_counter == connections
+    assert await asker.request('who', 'Dashboard', timeout=5) == 'first'
+    first.reconnect = False
+    await first.websocket.close()                               # the first one leaves: the held one takes over
+    await until(lambda: second.authorized and not second.on_hold)
+    assert await asker.request('who', 'Dashboard', timeout=5) == 'second'
+
+
+async def test_held_client_is_promoted_when_the_old_one_dies_later(server):
+    server.liveness_interval = 0.5
+    ghost = raw_verified_connection(server, 'Dashboard')
+    await until(lambda: 'Dashboard' in server.active_clients)
+    answer = server._pong_received                             # the ghost answers the first pings...
+    server.websocket._pong_received_ = answer
+    alive = {'yes': True}
+    real_ping = server._ping
+
+    def ping(handler):
+        if alive['yes']:
+            answer(handler, '')
+        else:
+            real_ping(handler)
+    server._ping = ping
+    new = await make_client_on_hold(server, 'Dashboard', who='new')
+    await asyncio.sleep(1)
+    assert new.on_hold                                          # still answering: stays
+    alive['yes'] = False                                        # ...then stops answering
+    await until(lambda: new.authorized and not new.on_hold)
     ghost.close()
 
 
-async def test_two_live_processes_with_the_same_name_do_not_flap(server):
-    """Both processes alive (should not happen): the replaced one reconnects at once and waits on hold, no loop."""
-    first = await make_client(server, 'Dashboard', who='first')
-    server.active_clients['Dashboard']['since'] -= 60                  # connected for a while
-    asker = await make_client(server, 'Cluster 0')
-    second = await make_client(server, 'Dashboard', who='second')
-    await until(lambda: first.on_hold)                          # replaced, reconnected, on hold
-    connections = server.websocket.id_counter
+async def test_blocked_send_to_the_old_connection_does_not_block_the_new_one(server):
+    """The old peer is gone with a full buffer: the sends to it block, the new client is still authorized."""
+    ghost = raw_verified_connection(server, 'Dashboard')
+    ghost.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    await until(lambda: 'Dashboard' in server.active_clients)
+    cluster = await make_client(server, 'Cluster 0')
+    # not awaited: the server thread of the cluster blocks on the ghost, so it stops reading the cluster too
+    flood = [asyncio.create_task(cluster.inform({'x': 'y' * 200_000}, destinations=['Dashboard'])) for _ in range(40)]
     await asyncio.sleep(0.5)
-    assert server.websocket.id_counter == connections           # no reconnection loop
-    assert await asker.request('who', 'Dashboard', timeout=5) == 'second'
-    second.reconnect = False
-    await second.websocket.close()                              # the other one leaves: the held one takes over
-    await until(lambda: first.authorized and not first.on_hold)
-    assert await asker.request('who', 'Dashboard', timeout=5) == 'first'
-
-
-async def test_recent_connection_is_not_replaced(server):
-    first = await make_client(server, 'Dashboard', who='first')
-    asker = await make_client(server, 'Cluster 0')
-    second = await make_client_on_hold(server, 'Dashboard')
-    assert second.on_hold
-    assert await asker.request('who', 'Dashboard', timeout=5) == 'first'
+    assert not all(task.done() for task in flood)               # the sends are really blocked
+    new = await make_client_on_hold(server, 'Dashboard', who='new')
+    await until(lambda: new.authorized and not new.on_hold)
+    await asyncio.wait_for(asyncio.gather(*flood), 10)         # closing the ghost unblocked the cluster
+    assert await cluster.request('who', 'Dashboard', timeout=5) == 'new'
+    ghost.close()
 
 
 async def test_tcp_probe_does_not_crash_the_server(server):
@@ -158,11 +182,11 @@ async def test_disconnect_frees_the_name(server):
         await asker.request('x', 'Cluster 3', timeout=2)
 
 
-async def test_replaced_connection_closing_keeps_the_new_one(server):
-    sock = raw_verified_connection(server, 'Dashboard')
-    await until(lambda: 'Dashboard' in server.active_clients)
-    server.active_clients['Dashboard']['since'] -= 60                  # connected for a while
-    new = await make_client(server, 'Dashboard')
-    sock.close()
+async def test_unreadable_message_does_not_close_the_connection(server):
+    sock = raw_verified_connection(server, 'Cluster 5')
+    await until(lambda: 'Cluster 5' in server.active_clients)
+    send_frame(sock, b'not json')
+    asker = await make_client(server, 'Cluster 6')
     await asyncio.sleep(0.3)
-    assert server.active_clients['Dashboard']['client']['id'] == max(c['id'] for c in server.websocket.clients)
+    assert 'Cluster 5' in server.active_clients
+    sock.close()
